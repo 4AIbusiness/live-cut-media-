@@ -35,3 +35,42 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           claude_args: '--allowedTools "Bash(git:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(npm:*),Bash(npx:*),Bash(pnpm:*),Bash(yarn:*)"'
+
+  # Tasks sent from Jade go live by themselves: open the pull request, wait for the
+  # Vercel preview build, and merge only if it built. A failed build is never merged.
+  ship:
+    needs: claude
+    if: github.event_name == 'issues' && contains(github.event.issue.labels.*.name, 'jade')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Open, check and merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          TITLE: ${{ github.event.issue.title }}
+        run: |
+          set -uo pipefail
+          BRANCH=$(gh api "repos/$REPO/branches?per_page=100" --paginate -q '.[].name' | grep "^claude/issue-$ISSUE-" | tail -1)
+          if [ -z "$BRANCH" ]; then echo "Claude made no code changes."; exit 0; fi
+          PR=$(gh pr list -R "$REPO" --head "$BRANCH" --state open --json number -q '.[0].number')
+          if [ -z "$PR" ]; then
+            gh pr create -R "$REPO" --head "$BRANCH" --title "$TITLE" --body "Closes #$ISSUE. Shipped automatically by Jade."
+            PR=$(gh pr list -R "$REPO" --head "$BRANCH" --state open --json number -q '.[0].number')
+          fi
+          SHA=$(gh api "repos/$REPO/commits/$BRANCH" -q .sha)
+          STATE=none
+          for i in $(seq 1 90); do
+            STATE=$(gh api "repos/$REPO/commits/$SHA/status" -q '[.statuses[] | select(.context | test("vercel"; "i"))][0].state // "none"')
+            if [ "$STATE" = success ] || [ "$STATE" = failure ] || [ "$STATE" = error ]; then break; fi
+            # No Vercel build after 3 minutes: nothing to wait for.
+            if [ "$STATE" = none ] && [ "$i" -ge 18 ]; then break; fi
+            sleep 10
+          done
+          if [ "$STATE" = failure ] || [ "$STATE" = error ]; then
+            gh issue comment "$ISSUE" -R "$REPO" --body "Jade: the build failed, so nothing went live. Pull request #$PR needs a look."
+            exit 1
+          fi
+          gh pr merge "$PR" -R "$REPO" --squash --delete-branch
+          gh issue comment "$ISSUE" -R "$REPO" --body "Jade: merged #$PR. It's going live now."
